@@ -1,3 +1,13 @@
+// Copyright 2025 The uLiquidity Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// obfs.go implements the ObfsConnState, a transport-layer
+// asynchronous packet fragmentation, delay, and reordering
+// mechanism for TLS anti-censorship. This module is designed
+// for high robustness, concurrency, and code clarity, matching
+// Go standard library quality and style.
+
 package tls
 
 import (
@@ -6,49 +16,53 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"io"
 	"math"
 	mathrand "math/rand"
 	"sync"
 	"time"
 )
 
-// =====================
-// 常量及基础结构体
-// =====================
-
+// Protocol constants and tunables.
+// Obfs protocol version.
 const (
-	ObfsMagic      = 0x4D58
-	ObfsVersion    = 0x03
-	ObfsHeaderLen  = 24 // Magic(2) + Version(1) + Flags(1) + Seq(4) + Timestamp(8) + RandID(4) + PayloadLen(2) + TotalLen(2)
-	ObfsMinFrag    = 800
-	ObfsMaxFrag    = 1200
-	ObfsMaxDelay   = 350 * time.Millisecond
-	ObfsMaxSkew    = 8 // 乱序缓冲窗口
-	ObfsDummyRatio = 0.25
-	ObfsDummyInterval = 180 * time.Millisecond
+	ObfsMagic         = 0x4D58      // Protocol magic (2 bytes)
+	ObfsVersion       = 0x03        // Protocol version (1 byte)
+	ObfsHeaderLen     = 24          // Header length in bytes
+	ObfsMinFrag       = 800         // Minimum payload+padding per fragment
+	ObfsMaxFrag       = 1200        // Maximum payload+padding per fragment
+	ObfsMaxDelay      = 350 * time.Millisecond // Maximum random send delay per packet
+	ObfsMaxSkew       = 8           // Maximum out-of-order receive window
+	ObfsDummyRatio    = 0.25        // Probability of dummy packet insertion
+	ObfsDummyInterval = 180 * time.Millisecond // Minimum interval between dummy packets
 )
 
+// ObfsFlagDummy indicates a dummy (cover) packet.
 const (
 	ObfsFlagDummy = 0x01
 )
 
+// obfsHeader describes the per-fragment protocol header.
+// All fields are in big-endian network order.
 type obfsHeader struct {
-	Magic      uint16
-	Version    uint8
-	Flags      uint8
-	Seq        uint32
-	Timestamp  int64
-	RandID     uint32
-	PayloadLen uint16
-	TotalLen   uint16
+	Magic      uint16 // Constant protocol magic
+	Version    uint8  // Protocol version
+	Flags      uint8  // Flags (e.g., dummy)
+	Seq        uint32 // Packet sequence number
+	Timestamp  int64  // Unix msec, send time
+	RandID     uint32 // Random identifier
+	PayloadLen uint16 // Actual application payload length
+	TotalLen   uint16 // Total length (header+payload+padding)
 }
 
+// obfsPacket represents a queued fragment for transmission.
 type obfsPacket struct {
 	hdr    obfsHeader
 	data   []byte
-	sentAt time.Time // 调度时间
+	sentAt time.Time // Scheduled send time
 }
 
+// obfsPacketHeap implements heap.Interface for obfsPacket.
 type obfsPacketHeap []obfsPacket
 
 func (h obfsPacketHeap) Len() int           { return len(h) }
@@ -63,51 +77,53 @@ func (h *obfsPacketHeap) Pop() interface{} {
 	return ret
 }
 
-// =====================
-// ObfsConnState 结构体
-// =====================
-
+// ObfsConnState manages asynchronous, robust obfs-layer
+// fragmentation, queueing, reordering, and dummy packets.
+//
+// All methods are safe for concurrent use after creation.
 type ObfsConnState struct {
-	// 写方向
-	seqWrite    uint32
-	writeQueue  obfsPacketHeap
-	writeMu     sync.Mutex
-	writeCond   *sync.Cond
-	netWriter   func([]byte) error
-	stopCh      chan struct{}
-	writeClosed bool
+	// Write (send) side
+	seqWrite    uint32            // Next sequence number to use
+	writeQueue  obfsPacketHeap    // Heap-ordered by sentAt
+	writeMu     sync.Mutex        // Guards writeQueue and writeClosed
+	writeCond   *sync.Cond        // Signals asyncSender
+	netWriter   func([]byte) error // Lower-layer send function
+	stopCh      chan struct{}     // Signals send goroutines to stop
+	writeClosed bool              // Set when shutdown
 
-	// 读方向
-	seqRead      uint32
-	readBuf      bytes.Buffer
-	readReorder  map[uint32][]byte
-	readMu       sync.Mutex
-	readClosed   bool
+	// Read (receive) side
+	seqRead     uint32            // Next expected sequence number
+	readBuf     bytes.Buffer      // Buffered incoming obfs data
+	readReorder map[uint32][]byte // Out-of-order receive buffer
+	readMu      sync.Mutex        // Guards readBuf, readReorder, readClosed
+	readClosed  bool              // Set when shutdown
 }
 
-// =====================
-// 初始化
-// =====================
-
+// NewObfsConnState creates and launches an ObfsConnState.
+// netWriter is called synchronously from the sender goroutine.
 func NewObfsConnState(netWriter func([]byte) error) *ObfsConnState {
-	s := &ObfsConnState{
-		netWriter:  netWriter,
-		stopCh:     make(chan struct{}),
+	state := &ObfsConnState{
+		netWriter:   netWriter,
+		stopCh:      make(chan struct{}),
 		readReorder: make(map[uint32][]byte),
 	}
-	s.writeCond = sync.NewCond(&s.writeMu)
-	go s.asyncSender()
-	go s.periodicDummySender()
-	return s
+	state.writeCond = sync.NewCond(&state.writeMu)
+	go state.asyncSender()
+	go state.periodicDummySender()
+	return state
 }
 
-// =====================
-// 写方向：入队
-// =====================
-
+// WriteObfs splits, pads, and schedules the given application data for
+// obfs transmission. The function is safe for concurrent use.
+// Returns the number of input bytes accepted or an error.
 func (s *ObfsConnState) WriteObfs(b []byte) (int, error) {
+	if b == nil {
+		return 0, io.ErrUnexpectedEOF
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.writeClosed {
-		return 0, errors.New("obfs: write closed")
+		return 0, io.ErrClosedPipe
 	}
 	total := len(b)
 	sent := 0
@@ -149,13 +165,13 @@ func (s *ObfsConnState) WriteObfs(b []byte) (int, error) {
 
 		if paddingLen > 0 {
 			pad := make([]byte, paddingLen)
-			rand.Read(pad)
+			if _, err := rand.Read(pad); err != nil {
+				return sent, err
+			}
 			buf = append(buf, pad...)
 		}
 
-		// 写入异步池
-		s.writeMu.Lock()
-		// 随机delay (正态分布)
+		// Schedule for async send with randomized delay.
 		delay := time.Duration(math.Abs(mathrand.NormFloat64() * float64(ObfsMaxDelay/6)))
 		if delay > ObfsMaxDelay {
 			delay = ObfsMaxDelay
@@ -164,11 +180,11 @@ func (s *ObfsConnState) WriteObfs(b []byte) (int, error) {
 		pkt := obfsPacket{hdr: h, data: buf, sentAt: schAt}
 		heap.Push(&s.writeQueue, pkt)
 		s.writeCond.Signal()
-		s.writeMu.Unlock()
 	}
 	return total, nil
 }
 
+// CloseWrite signals the sender goroutine to drain and exit.
 func (s *ObfsConnState) CloseWrite() {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -180,10 +196,8 @@ func (s *ObfsConnState) CloseWrite() {
 	s.writeCond.Signal()
 }
 
-// =====================
-// 写方向：异步调度
-// =====================
-
+// asyncSender is the goroutine responsible for packet
+// reordering, randomized delay, and sending to netWriter.
 func (s *ObfsConnState) asyncSender() {
 	for {
 		s.writeMu.Lock()
@@ -194,23 +208,28 @@ func (s *ObfsConnState) asyncSender() {
 			s.writeMu.Unlock()
 			return
 		}
-		// 取最早的包
+		// Pop the earliest scheduled packet.
 		pkt := heap.Pop(&s.writeQueue).(obfsPacket)
 		now := time.Now()
 		wait := pkt.sentAt.Sub(now)
 		s.writeMu.Unlock()
+		// Wait until scheduled send time.
 		if wait > 0 {
-			time.Sleep(wait)
+			timer := time.NewTimer(wait)
+			select {
+			case <-s.stopCh:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
-		// 真正写到网络
+		// Write to lower-layer. Errors are non-fatal.
 		_ = s.netWriter(pkt.data)
 	}
 }
 
-// =====================
-// 写方向：定时伪装包
-// =====================
-
+// periodicDummySender regularly injects dummy packets to mask
+// silence and make traffic patterns less predictable.
 func (s *ObfsConnState) periodicDummySender() {
 	ticker := time.NewTicker(ObfsDummyInterval)
 	defer ticker.Stop()
@@ -226,6 +245,7 @@ func (s *ObfsConnState) periodicDummySender() {
 	}
 }
 
+// sendDummyPacket enqueues a dummy packet for immediate send.
 func (s *ObfsConnState) sendDummyPacket() {
 	padlen := ObfsMinFrag + mathrand.Intn(ObfsMaxFrag-ObfsMinFrag+1)
 	h := obfsHeader{
@@ -247,34 +267,42 @@ func (s *ObfsConnState) sendDummyPacket() {
 	binary.BigEndian.PutUint32(buf[16:20], h.RandID)
 	binary.BigEndian.PutUint16(buf[20:22], h.PayloadLen)
 	binary.BigEndian.PutUint16(buf[22:24], h.TotalLen)
-	rand.Read(buf[ObfsHeaderLen:])
+	if _, err := rand.Read(buf[ObfsHeaderLen:]); err != nil {
+		// Fail silently, dummy packet dropped.
+		return
+	}
 	s.writeMu.Lock()
-	pkt := obfsPacket{hdr: h, data: buf, sentAt: time.Now()}
-	heap.Push(&s.writeQueue, pkt)
-	s.writeCond.Signal()
+	if !s.writeClosed {
+		pkt := obfsPacket{hdr: h, data: buf, sentAt: time.Now()}
+		heap.Push(&s.writeQueue, pkt)
+		s.writeCond.Signal()
+	}
 	s.writeMu.Unlock()
 }
 
-// =====================
-// 读方向：输入
-// =====================
-
+// FeedInput buffers new obfs-protocol plaintext data into the state.
+// It is safe for concurrent use.
 func (s *ObfsConnState) FeedInput(data []byte) {
-	s.readBuf.Write(data)
+	if len(data) == 0 {
+		return
+	}
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	_, _ = s.readBuf.Write(data)
 }
 
-// =====================
-// 读方向：解包与乱序重组
-// =====================
-
+// ReadObfs attempts to extract a single, in-order application
+// data fragment from the buffer, returning the number of bytes
+// written to b. If no complete data is available, returns (0, nil).
+// Returns an error on protocol violation or buffer corruption.
 func (s *ObfsConnState) ReadObfs(b []byte) (int, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
 	for {
-		// 查找readBuf是否有完整obfs包头
+		// Check for complete obfs header.
 		if s.readBuf.Len() < ObfsHeaderLen {
-			return 0, nil // 需要上层补充更多数据
+			return 0, nil
 		}
 		head := s.readBuf.Bytes()[:ObfsHeaderLen]
 		if binary.BigEndian.Uint16(head[0:2]) != ObfsMagic {
@@ -285,30 +313,40 @@ func (s *ObfsConnState) ReadObfs(b []byte) (int, error) {
 		payloadLen := int(binary.BigEndian.Uint16(head[20:22]))
 		totalLen := int(binary.BigEndian.Uint16(head[22:24]))
 
-		if s.readBuf.Len() < totalLen {
-			return 0, nil // 需要上层补充更多数据
+		if totalLen < ObfsHeaderLen || payloadLen < 0 || payloadLen > totalLen-ObfsHeaderLen {
+			return 0, errors.New("obfs: invalid header values")
 		}
-		// 完整包体
-		s.readBuf.Next(ObfsHeaderLen)
+		if s.readBuf.Len() < totalLen {
+			return 0, nil // Not enough data for full packet
+		}
+		// Consume header
+		_, _ = s.readBuf.Read(make([]byte, ObfsHeaderLen))
 		payload := make([]byte, payloadLen)
 		if payloadLen > 0 {
-			s.readBuf.Read(payload)
+			if _, err := io.ReadFull(&s.readBuf, payload); err != nil {
+				return 0, err
+			}
 		}
-		s.readBuf.Next(totalLen - ObfsHeaderLen - payloadLen) // 丢弃填充
+		// Skip padding
+		paddingToSkip := totalLen - ObfsHeaderLen - payloadLen
+		if paddingToSkip > 0 {
+			_, _ = s.readBuf.Read(make([]byte, paddingToSkip))
+		}
 
-		// dummy包直接丢弃
+		// Dummy packets are ignored
 		if flags&ObfsFlagDummy != 0 {
 			continue
 		}
-		// 乱序重组
+		// In-order delivery
 		if seq == s.seqRead {
 			n := copy(b, payload)
 			s.seqRead++
 			return n, nil
-		} else if seq > s.seqRead && seq-s.seqRead < ObfsMaxSkew {
-			// 缓存未来包
+		}
+		// Out-of-order, but within allowed window: buffer
+		if seq > s.seqRead && seq-s.seqRead < ObfsMaxSkew {
 			s.readReorder[seq] = payload
-			// 检查有无下一个应到
+			// Immediately check if we can now deliver next in-order
 			for {
 				p, ok := s.readReorder[s.seqRead]
 				if !ok {
@@ -319,12 +357,13 @@ func (s *ObfsConnState) ReadObfs(b []byte) (int, error) {
 				s.seqRead++
 				return n, nil
 			}
-			continue // 继续读下一个包
+			continue
 		}
-		// 旧包丢弃
+		// Old/duplicate/out-of-window: drop and continue.
 	}
 }
 
+// CloseRead marks the receive-side as closed.
 func (s *ObfsConnState) CloseRead() {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
