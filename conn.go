@@ -1113,17 +1113,18 @@ var (
 	errShutdown = errors.New("tls: protocol is shutdown")
 )
 
-// Write writes data to the connection.
+// Write writes application data to the TLS connection, ensuring handshake completion,
+// proper locking, error handling, and integration with the obfs layer for advanced
+// traffic obfuscation and cover traffic. It fully implements the net.Conn interface.
 //
 // As Write calls Handshake, in order to prevent indefinite blocking a deadline
 // must be set for both Read and Write before Write is called when the handshake
-// has not yet completed. See SetDeadline, SetReadDeadline, and
-// SetWriteDeadline.
-// ===========================
-// Write：调用obfs写入
-// ===========================
+// has not yet completed. See SetDeadline, SetReadDeadline, and SetWriteDeadline.
+//
+// Returns the number of bytes written and any error encountered. If the handshake
+// fails or the connection is closed, no data is written.
 func (c *Conn) Write(b []byte) (int, error) {
-	// 原有握手、互斥逻辑不变
+	// Prevent concurrent Write/Close.
 	for {
 		x := atomic.LoadInt32(&c.activeCall)
 		if x&1 != 0 {
@@ -1135,6 +1136,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 	}
 	defer atomic.AddInt32(&c.activeCall, -2)
 
+	// Ensure handshake is complete before writing.
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
@@ -1142,21 +1144,33 @@ func (c *Conn) Write(b []byte) (int, error) {
 	c.out.Lock()
 	defer c.out.Unlock()
 
+	// Check for permanent errors and protocol shutdown.
 	if err := c.out.err; err != nil {
 		return 0, err
 	}
-
 	if !c.handshakeComplete() {
 		return 0, errors.New("tls: internal error: handshake not complete")
 	}
-
 	if c.closeNotifySent {
 		return 0, errors.New("tls: protocol is shutdown")
 	}
 
+	// Initialize obfs layer if not done.
 	c.initObfs()
+	// Defensive: ensure obfs is not nil.
+	if c.obfs == nil {
+		return 0, errors.New("tls: obfs layer not initialized")
+	}
+
+	// Send data through the obfs layer.
 	n, err := c.obfs.WriteObfs(b)
-	return n, err
+	if n < 0 {
+		n = 0
+	}
+	if err != nil {
+		return n, err
+	}
+	return n, nil
 }
 
 // handleRenegotiation processes a HelloRequest handshake message.
@@ -1261,30 +1275,36 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 	return nil
 }
 
-// Read reads data from the connection.
+// Read reads application data from the TLS connection, ensuring handshake completion,
+// proper locking, error handling, and integration with the obfs layer for advanced
+// traffic obfuscation and cover traffic. It fully implements the net.Conn interface.
 //
 // As Read calls Handshake, in order to prevent indefinite blocking a deadline
 // must be set for both Read and Write before Read is called when the handshake
-// has not yet completed. See SetDeadline, SetReadDeadline, and
-// SetWriteDeadline.
-// ===========================
-// Read：调用obfs解包
-// ===========================
+// has not yet completed. See SetDeadline, SetReadDeadline, and SetWriteDeadline.
+//
+// Returns the number of bytes read and any error encountered. If the handshake
+// fails or the connection is closed, no data is returned.
 func (c *Conn) Read(b []byte) (int, error) {
+	// Ensure handshake is complete before reading.
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
 	if len(b) == 0 {
+		// As per net.Conn contract: zero-length reads return (0, nil).
 		return 0, nil
 	}
+
 	c.in.Lock()
 	defer c.in.Unlock()
-
 	c.initObfs()
+	// Defensive: ensure obfs is not nil.
+	if c.obfs == nil {
+		return 0, errors.New("tls: obfs layer not initialized")
+	}
 
-	// 首先尝试从obfs缓冲区读取
 	for {
-		// 尝试解出一个完整包
+		// Try to extract a complete decrypted payload from the obfs buffer.
 		n, err := c.obfs.ReadObfs(b)
 		if err != nil {
 			return 0, err
@@ -1292,15 +1312,20 @@ func (c *Conn) Read(b []byte) (int, error) {
 		if n > 0 {
 			return n, nil
 		}
-		// 没有完整包，则补充网络输入
+		// If not enough data, read more from the underlying TLS record layer.
 		if err := c.readRecord(); err != nil {
 			return 0, err
 		}
-		// 将新收到的明文数据送入obfs
+		// Feed newly received cleartext data to the obfs layer.
 		if c.input.Len() > 0 {
 			buf := make([]byte, c.input.Len())
-			n, _ := c.input.Read(buf)
-			c.obfs.FeedInput(buf[:n])
+			m, readErr := c.input.Read(buf)
+			if readErr != nil && readErr != io.EOF {
+				return 0, readErr
+			}
+			if m > 0 {
+				c.obfs.FeedInput(buf[:m])
+			}
 		}
 	}
 }
