@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nXTLS/Go/internal/godebug"
+	"github.com/uLiquidity/Go/internal/godebug"
 )
 
 const (
