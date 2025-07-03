@@ -1,4 +1,4 @@
-module github.com/nXTLS/Go
+module github.com/uLiquidity/Go
 
 go 1.18
 
