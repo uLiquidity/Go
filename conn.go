@@ -116,6 +116,21 @@ type Conn struct {
 	activeCall int32
 
 	tmp [16]byte
+
+	obfs *ObfsConnState
+	obfsMu sync.Mutex
+}
+
+// 初始化Obfs
+func (c *Conn) initObfs() {
+	c.obfsMu.Lock()
+	defer c.obfsMu.Unlock()
+	if c.obfs == nil {
+		c.obfs = NewObfsConnState(func(pkt []byte) error {
+			_, err := c.writeRecordLocked(recordTypeApplicationData, pkt)
+			return err
+		})
+	}
 }
 
 // Access to net.Conn methods.
@@ -1104,12 +1119,15 @@ var (
 // must be set for both Read and Write before Write is called when the handshake
 // has not yet completed. See SetDeadline, SetReadDeadline, and
 // SetWriteDeadline.
+// ===========================
+// Write：调用obfs写入
+// ===========================
 func (c *Conn) Write(b []byte) (int, error) {
-	// interlock with Close below
+	// 原有握手、互斥逻辑不变
 	for {
 		x := atomic.LoadInt32(&c.activeCall)
 		if x&1 != 0 {
-			return 0, net.ErrClosed
+			return 0, io.ErrClosedPipe
 		}
 		if atomic.CompareAndSwapInt32(&c.activeCall, x, x+2) {
 			break
@@ -1129,35 +1147,16 @@ func (c *Conn) Write(b []byte) (int, error) {
 	}
 
 	if !c.handshakeComplete() {
-		return 0, alertInternalError
+		return 0, errors.New("tls: internal error: handshake not complete")
 	}
 
 	if c.closeNotifySent {
-		return 0, errShutdown
+		return 0, errors.New("tls: protocol is shutdown")
 	}
 
-	// TLS 1.0 is susceptible to a chosen-plaintext
-	// attack when using block mode ciphers due to predictable IVs.
-	// This can be prevented by splitting each Application Data
-	// record into two records, effectively randomizing the IV.
-	//
-	// https://www.openssl.org/~bodo/tls-cbc.txt
-	// https://bugzilla.mozilla.org/show_bug.cgi?id=665814
-	// https://www.imperialviolet.org/2012/01/15/beastfollowup.html
-
-	var m int
-	if len(b) > 1 && c.vers == VersionTLS10 {
-		if _, ok := c.out.cipher.(cipher.BlockMode); ok {
-			n, err := c.writeRecordLocked(recordTypeApplicationData, b[:1])
-			if err != nil {
-				return n, c.out.setErrorLocked(err)
-			}
-			m, b = 1, b[1:]
-		}
-	}
-
-	n, err := c.writeRecordLocked(recordTypeApplicationData, b)
-	return n + m, c.out.setErrorLocked(err)
+	c.initObfs()
+	n, err := c.obfs.WriteObfs(b)
+	return n, err
 }
 
 // handleRenegotiation processes a HelloRequest handshake message.
@@ -1268,47 +1267,39 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 // must be set for both Read and Write before Read is called when the handshake
 // has not yet completed. See SetDeadline, SetReadDeadline, and
 // SetWriteDeadline.
+// ===========================
+// Read：调用obfs解包
+// ===========================
 func (c *Conn) Read(b []byte) (int, error) {
 	if err := c.Handshake(); err != nil {
 		return 0, err
 	}
 	if len(b) == 0 {
-		// Put this after Handshake, in case people were calling
-		// Read(nil) for the side effect of the Handshake.
 		return 0, nil
 	}
-
 	c.in.Lock()
 	defer c.in.Unlock()
 
-	for c.input.Len() == 0 {
+	c.initObfs()
+
+	// 首先尝试从obfs缓冲区读取
+	for {
+		// 尝试解出一个完整包
+		n, err := c.obfs.ReadObfs(b)
+		if err != nil {
+			return 0, err
+		}
+		if n > 0 {
+			return n, nil
+		}
+		// 没有完整包，则补充网络输入
 		if err := c.readRecord(); err != nil {
 			return 0, err
 		}
-		for c.hand.Len() > 0 {
-			if err := c.handlePostHandshakeMessage(); err != nil {
-				return 0, err
-			}
-		}
+		// 将新收到的明文数据送入obfs
+		c.obfs.FeedInput(c.input.Bytes())
+		c.input.Reset(nil)
 	}
-
-	n, _ := c.input.Read(b)
-
-	// If a close-notify alert is waiting, read it so that we can return (n,
-	// EOF) instead of (n, nil), to signal to the HTTP response reading
-	// goroutine that the connection is now closed. This eliminates a race
-	// where the HTTP response reading goroutine would otherwise not observe
-	// the EOF until its next read, by which time a client goroutine might
-	// have already tried to reuse the HTTP connection for a new request.
-	// See https://golang.org/cl/76400046 and https://golang.org/issue/3514
-	if n != 0 && c.input.Len() == 0 && c.rawInput.Len() > 0 &&
-		recordType(c.rawInput.Bytes()[0]) == recordTypeAlert {
-		if err := c.readRecord(); err != nil {
-			return n, err // will be io.EOF on closeNotify
-		}
-	}
-
-	return n, nil
 }
 
 // Close closes the connection.
