@@ -1297,8 +1297,11 @@ func (c *Conn) Read(b []byte) (int, error) {
 			return 0, err
 		}
 		// 将新收到的明文数据送入obfs
-		c.obfs.FeedInput(c.input.Bytes())
-		c.input.Reset(nil)
+		if c.input.Len() > 0 {
+			buf := make([]byte, c.input.Len())
+			n, _ := c.input.Read(buf)
+			c.obfs.FeedInput(buf[:n])
+		}
 	}
 }
 
